@@ -171,8 +171,19 @@ func newRaft(c *Config) *Raft {
 	// Your Code Here (2A)
 	votes := make(map[uint64]bool, len(c.peers))
 	prs := make(map[uint64]*Progress, len(c.peers))
+	raftLog := newLog(c.Storage)
 	for _, peer := range c.peers {
-		prs[peer] = nil
+		if peer == c.ID {
+			prs[peer] = &Progress{
+				Next:  raftLog.LastIndex() + 1,
+				Match: raftLog.LastIndex(),
+			}
+		} else {
+			prs[peer] = &Progress{
+				Next:  raftLog.LastIndex() + 1,
+				Match: 0,
+			}
+		}
 	}
 	hardState, _, err := c.Storage.InitialState()
 	if err != nil {
@@ -182,7 +193,7 @@ func newRaft(c *Config) *Raft {
 		id:                    c.ID,
 		Term:                  hardState.Term,
 		Vote:                  hardState.Vote,
-		RaftLog:               newLog(c.Storage),
+		RaftLog:               raftLog,
 		Prs:                   prs,
 		State:                 StateFollower,
 		votes:                 votes,
@@ -224,13 +235,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	prevLogIndex := r.Prs[to].Next - 1
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	if err != nil {
+		panic(err)
+	}
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		LogTerm: 0, // TODO
-		Index:   0, // TODO
+		LogTerm: prevLogIndex,
+		Index:   prevLogTerm,
 		Commit:  r.RaftLog.committed,
 	}
 	r.msgs = append(r.msgs, msg)
@@ -417,6 +433,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgAppendResponse:
 		r.handleAppendEntriesResponse(m)
 	case pb.MessageType_MsgHeartbeatResponse:
+		r.handleHeartbeatResponse(m)
 	}
 	return nil
 }
@@ -629,13 +646,37 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	// reject := false
+	// if m.Term < r.Term {
+	// 	reject = true
+	// }
+	// if !reject {
+	// 	if m.Commit > r.RaftLog.committed {
+	// 		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+	// 	}
+	// }
+
 	reject := false
 	if m.Term < r.Term {
 		reject = true
+	} else if m.Index > r.RaftLog.LastIndex() {
+		reject = true
+	} else {
+		term, err := r.RaftLog.Term(m.Index)
+		if err == ErrCompacted {
+			reject = true
+		} else if err != nil {
+			panic(err)
+		} else if term != m.LogTerm {
+			reject = true
+		}
 	}
-	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+	if !reject {
+		if m.Commit > r.RaftLog.committed {
+			r.RaftLog.committed = min(m.Commit, m.Index)
+		}
 	}
+
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      m.From,
@@ -644,6 +685,17 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		Reject:  reject,
 	}
 	r.msgs = append(r.msgs, msg)
+}
+
+func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	// 防止过去请求的响应干扰本轮选举
+	if m.Term != r.Term {
+		return
+	}
+	// 如果尚未同步完成, 发送AppendEntry
+	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+		r.sendAppend(m.From)
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
