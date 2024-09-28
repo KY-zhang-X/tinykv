@@ -79,19 +79,11 @@ func newLog(storage Storage) *RaftLog {
 	return &RaftLog{
 		storage:   storage,
 		first:     firstIndex,
-		applied:   firstIndex,
+		applied:   firstIndex - 1,
 		committed: hardState.GetCommit(),
 		stabled:   lastIndex,
 		entries:   entries,
 	}
-	// return &RaftLog{
-	// 	storage:    storage,
-	// 	committed:  0,
-	// 	applied:    0,
-	// 	stabled:    0,
-	// 	entries:    []pb.Entry{},
-	// 	firstIndex: 0,
-	// }
 }
 
 // We need to compact the log entries in some point of time like
@@ -106,11 +98,9 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	allEnts := make([]pb.Entry, len(l.entries))
+	allEnts := make([]pb.Entry, 0, len(l.entries))
 	for _, ent := range l.entries {
-		if ent.Data != nil {
-			allEnts = append(allEnts, ent)
-		}
+		allEnts = append(allEnts, ent)
 	}
 	return allEnts
 }
@@ -118,13 +108,13 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled:]
+	return l.entries[l.stabled+1-l.first:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	ents = l.entries[l.applied+1 : l.committed+1]
+	ents = l.entries[l.applied+1-l.first : l.committed+1-l.first]
 	return ents
 }
 
@@ -138,7 +128,11 @@ func (l *RaftLog) LastIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	if i < l.first {
-		return 0, nil
+		// FIXME: i == l.first-1的情况应该从Snapshot中取
+		if i == 0 {
+			return 0, nil
+		}
+		return 0, ErrCompacted
 	}
 	if i > l.LastIndex() {
 		return 0, ErrUnavailable
@@ -155,13 +149,41 @@ func (l *RaftLog) AppendEntry(ent *pb.Entry) {
 	})
 }
 
+func (l *RaftLog) DeleteEntries(i uint64) error {
+	if i < l.first || i > l.LastIndex()+1 {
+		return ErrUnavailable
+	}
+	if i-1 < l.stabled {
+		l.stabled = i - 1
+		// FIXME: 重新持久化
+	}
+	l.entries = l.entries[:i-l.first]
+	return nil
+}
+
 func (l *RaftLog) AppendEntries(i uint64, ents []*pb.Entry) error {
 	if i < l.first || i > l.LastIndex()+1 {
 		return ErrUnavailable
 	}
-	l.entries = l.entries[:i-l.first]
-	for _, ent := range ents {
-		l.entries = append(l.entries, *ent)
+	// 尝试覆盖原来冲突的条目, 如果不冲突则不覆盖
+	// 找到第一个冲突的条目
+	ci := i
+	for ; ci-i < uint64(len(ents)) && ci-l.first < uint64(len(l.entries)); ci++ {
+		if l.entries[ci-l.first].Term != ents[ci-i].Term {
+			break
+		}
+	}
+	// 如果没有冲突则不需要复制后续内容
+	if ci-i == uint64(len(ents)) {
+		return nil
+	}
+	// 如果有冲突依次复制
+	// 删除ci之后的内容
+	if err := l.DeleteEntries(ci); err != nil {
+		return err
+	}
+	for ; ci-i < uint64(len(ents)); ci++ {
+		l.entries = append(l.entries, *ents[ci-i])
 	}
 	return nil
 }
@@ -173,7 +195,8 @@ func (l *RaftLog) Entries(lo uint64) ([]*pb.Entry, error) {
 
 	ents := make([]*pb.Entry, 0, len(l.entries)-int(lo-l.first))
 	for _, entry := range l.entries[lo-l.first:] {
-		ents = append(ents, &entry)
+		entryCopy := entry
+		ents = append(ents, &entryCopy)
 	}
 	return ents, nil
 }

@@ -201,14 +201,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if err != nil {
 		panic(err)
 	}
-	// 检查是否需要发送
-	if r.RaftLog.LastIndex() <= prevLogIndex {
-		return false
-	}
+	// 检查需要发送什么entry
 	entries, err := r.RaftLog.Entries(prevLogIndex + 1)
 	if err != nil {
 		panic(err)
 	}
+	// 构造Message并发送
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To:      to,
@@ -312,32 +310,42 @@ func (r *Raft) becomeCandidate() {
 	for k := range r.votes {
 		delete(r.votes, k)
 	}
+	// 投票给自己
+	r.Vote = r.id
+	r.votes[r.id] = true
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	// 更新状态
 	r.State = StateLeader
 	r.heartbeatElapsed = 0
+	// 更新Prs
 	for peer := range r.Prs {
 		if peer == r.id {
-			continue
-		}
-		r.Prs[peer] = &Progress{
-			Next:  r.RaftLog.LastIndex() + 1,
-			Match: 0,
+			r.Prs[peer] = &Progress{
+				Next:  r.RaftLog.LastIndex() + 1,
+				Match: r.RaftLog.LastIndex(),
+			}
+		} else {
+			r.Prs[peer] = &Progress{
+				Next:  r.RaftLog.LastIndex() + 1,
+				Match: 0,
+			}
 		}
 	}
+	// 产生一个noop的条目
 	noop := pb.Entry{
 		EntryType: pb.EntryType_EntryNormal,
 		Data:      nil,
 	}
-	msg := pb.Message{
+	propose := pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
 		Entries: []*pb.Entry{&noop},
 	}
-	r.Step(msg)
+	r.Step(propose)
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -345,11 +353,7 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if m.Term > r.Term {
-		lead := None
-		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat {
-			lead = m.From
-		}
-		r.becomeFollower(m.Term, lead)
+		r.becomeFollower(m.Term, None)
 	}
 	switch r.State {
 	case StateFollower:
@@ -367,10 +371,12 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	case pb.MessageType_MsgHup:
 		r.handleHup(m)
 	case pb.MessageType_MsgAppend:
+		r.Lead = m.From
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgHeartbeat:
+		r.Lead = m.From
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgPropose:
 		r.handleMsgPropose(m)
@@ -399,17 +405,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
-		// // 检查Term, 防止过去的消息影响当前状态
-		// if m.Term != r.Term {
-		// 	return nil
-		// }
-		// 发送HeartBeat
-		for peer := range r.Prs {
-			if peer == r.id {
-				continue
-			}
-			r.sendHeartbeat(peer)
-		}
+		r.bcastHeartbeat()
 	case pb.MessageType_MsgPropose:
 		r.handleMsgPropose(m)
 	case pb.MessageType_MsgAppend:
@@ -428,26 +424,27 @@ func (r *Raft) stepLeader(m pb.Message) error {
 func (r *Raft) updateElectionState() {
 	nPeers := len(r.Prs)
 	nVotes := 0
+	nRejects := 0
 	for _, voteForMe := range r.votes {
 		if voteForMe {
 			nVotes += 1
+		} else {
+			nRejects += 1
 		}
-	}
-	nRejects := len(r.votes) - nVotes
-	// 获得半数以上节点的支持, 自动成为leader; 获得半数以上节点的拒绝, 自动降级为follower
-	if nVotes >= nPeers/2+1 {
-		r.becomeLeader()
-	} else if nRejects >= nPeers/2+1 {
-		r.becomeFollower(r.Term, None)
+		// 获得半数以上节点的支持, 自动成为leader; 获得半数以上节点的拒绝, 自动降级为follower
+		if nVotes >= nPeers/2+1 {
+			r.becomeLeader()
+			break
+		} else if nRejects >= nPeers/2+1 {
+			r.becomeFollower(r.Term, None)
+			break
+		}
 	}
 }
 
 func (r *Raft) handleHup(m pb.Message) {
 	// 成为candidate
 	r.becomeCandidate()
-	// 投票给自己
-	r.Vote = r.id
-	r.votes[r.id] = true
 	// 向其他节点发送RequestVote RPC
 	lastIndex := r.RaftLog.LastIndex()
 	lastLogTerm, err := r.RaftLog.Term(lastIndex)
@@ -479,15 +476,23 @@ func (r *Raft) handleMsgPropose(m pb.Message) {
 		r.msgs = append(r.msgs, m)
 		return
 	}
-	hardState, _, err := r.RaftLog.storage.InitialState()
-	if err != nil {
-		panic(err)
-	}
+	// hardState, _, err := r.RaftLog.storage.InitialState()
+	// if err != nil {
+	// 	panic(err)
+	// }
 	// 添加Entry到本地
 	for _, ent := range m.Entries {
-		ent.Term = hardState.Term
+		// ent.Term = hardState.Term
+		if ent.Term == 0 {
+			ent.Term = r.Term
+		}
 		r.RaftLog.AppendEntry(ent)
 	}
+	// 更新本地的Prs
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	// 尝试更新Committed
+	r.updateCommitted(r.RaftLog.LastIndex())
 	// 广播添加Entry
 	r.bcastAppend()
 }
@@ -537,10 +542,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		reject = true
 	} else {
 		term, err := r.RaftLog.Term(m.Index)
-		if err != nil {
+		if err == ErrCompacted {
+			reject = true
+		} else if err != nil {
 			panic(err)
-		}
-		if term != m.LogTerm {
+		} else if term != m.LogTerm {
 			reject = true
 		}
 	}
@@ -549,10 +555,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if err != nil {
 			panic(err)
 		}
-	}
-
-	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+		if m.Commit > r.RaftLog.committed {
+			// 根据m.Entries中最后一个项的Index更新committed
+			r.RaftLog.committed = min(m.Commit, m.Index+1+uint64(len(m.Entries))-1)
+		}
 	}
 
 	msg := pb.Message{
@@ -566,30 +572,34 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.msgs = append(r.msgs, msg)
 }
 
-func (r *Raft) updateMatchAndCommitted(m pb.Message) {
-	// 尝试推进Match
-	if m.Index <= r.Prs[m.From].Match {
-		return
-	}
-	r.Prs[m.From].Match = m.Index
-
+func (r *Raft) updateCommitted(index uint64) bool {
 	// 尝试统计数量并推进提交
-	if m.Index <= r.RaftLog.committed {
-		return
+	if index <= r.RaftLog.committed {
+		return false
 	}
-	count := 1
-	for peer, prs := range r.Prs {
-		if peer == r.id {
-			continue
-		}
-		if prs.Match >= m.Index {
+	// 不对过去term的log进行提交
+	if term, err := r.RaftLog.Term(index); err != nil {
+		panic(err)
+	} else if term != r.Term {
+		return false
+	}
+
+	update := false
+	count := 0
+	for _, prs := range r.Prs {
+		if prs.Match >= index {
 			count += 1
 		}
 		if count >= len(r.Prs)/2+1 {
-			r.RaftLog.committed = m.Index
+			update = true
 			break
 		}
 	}
+	// 半数以上节点达到index, 则将committed推进到index
+	if update {
+		r.RaftLog.committed = index
+	}
+	return update
 }
 
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
@@ -603,7 +613,16 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		r.sendAppend(m.From)
 	} else {
 		// 如果请求没有被拒绝, 则更新Match和Committed
-		r.updateMatchAndCommitted(m)
+		// 尝试推进Match和Next
+		if m.Index <= r.Prs[m.From].Match {
+			return
+		}
+		r.Prs[m.From].Match = m.Index
+		r.Prs[m.From].Next = m.Index + 1
+		// 尝试更新Committed
+		if r.updateCommitted(m.Index) {
+			r.bcastAppend()
+		}
 	}
 }
 
